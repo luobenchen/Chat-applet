@@ -1,0 +1,165 @@
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class ChatServer {
+    private static final int PORT = 8888;
+    private static Map<String, ClientHandler> clients = new ConcurrentHashMap<>();
+    private static ExecutorService pool = Executors.newCachedThreadPool();
+
+    public static void main(String[] args) {
+        try (ServerSocket serverSocket = new ServerSocket(PORT, 50, InetAddress.getByName("0.0.0.0"))) {
+            System.out.println("服务器已启动，监听端口: " + PORT);
+
+            while (true) {
+                Socket socket = serverSocket.accept();
+                ClientHandler clientHandler = new ClientHandler(socket);
+                pool.execute(clientHandler);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static void broadcast(String message, String sender, String receiver) {
+        if (receiver == null || receiver.equals("all")) {
+            // 广播给所有人
+            for (ClientHandler client : clients.values()) {
+                if (!client.username.equals(sender)) {
+                    client.sendMessage(message);
+                }
+            }
+        } else {
+            // 私聊
+            ClientHandler targetClient = clients.get(receiver);
+            if (targetClient != null) {
+                targetClient.sendMessage(message);
+            }
+        }
+    }
+
+    public static void forwardFile(String sender, String receiver, String fileName, long fileSize, Socket fileSocket) {
+        ClientHandler targetClient = clients.get(receiver);
+        if (targetClient != null) {
+            try {
+                targetClient.sendFile(sender, fileName, fileSize, fileSocket);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public static void addClient(String username, ClientHandler client) {
+        clients.put(username, client);
+    }
+
+    public static void removeClient(String username) {
+        clients.remove(username);
+    }
+
+    public static boolean isUsernameTaken(String username) {
+        return clients.containsKey(username);
+    }
+
+    private static class ClientHandler implements Runnable {
+        private Socket socket;
+        private PrintWriter out;
+        private BufferedReader in;
+        private String username;
+
+        public ClientHandler(Socket socket) {
+            this.socket = socket;
+        }
+
+        @Override
+        public void run() {
+            try {
+                out = new PrintWriter(socket.getOutputStream(), true);
+                in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+
+                // 登录验证
+                out.println("请输入用户名:");
+                username = in.readLine();
+
+                while (isUsernameTaken(username)) {
+                    out.println("用户名已存在，请重新输入:");
+                    username = in.readLine();
+                }
+
+                addClient(username, this);
+                broadcast(username + " 加入了聊天室", "服务器", null);
+                out.println("欢迎, " + username + "! 输入@用户名 内容 进行私聊，输入#接收者 文件名 发送文件");
+
+                String clientMessage;
+                while ((clientMessage = in.readLine()) != null) {
+                    if (clientMessage.startsWith("@")) {
+                        // 私聊消息
+                        int spaceIndex = clientMessage.indexOf(' ');
+                        if (spaceIndex > 0) {
+                            String receiver = clientMessage.substring(1, spaceIndex);
+                            String msg = clientMessage.substring(spaceIndex + 1);
+                            broadcast("[私聊 from " + username + " to " + receiver + "]: " + msg, username, receiver);
+                        }
+                    } else if (clientMessage.startsWith("#")) {
+                        // 文件传输请求
+                        int spaceIndex = clientMessage.indexOf(' ');
+                        if (spaceIndex > 0) {
+                            String receiver = clientMessage.substring(1, spaceIndex);
+                            String fileName = clientMessage.substring(spaceIndex + 1);
+
+                            // 发送文件传输请求
+                            broadcast("[文件传输 from " + username + " to " + receiver + "]: " + fileName, username, receiver);
+
+                            // 接收文件并转发
+                            try (ServerSocket fileServerSocket = new ServerSocket(0)) {
+                                out.println("FILE_PORT:" + fileServerSocket.getLocalPort());
+                                Socket fileSocket = fileServerSocket.accept();
+                                forwardFile(username, receiver, fileName, -1, fileSocket);
+                            }
+                        }
+                    } else {
+                        // 群聊消息
+                        broadcast(username + ": " + clientMessage, username, null);
+                    }
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                if (username != null) {
+                    broadcast(username + " 离开了聊天室", "服务器", null);
+                    removeClient(username);
+                }
+            }
+        }
+
+        public void sendMessage(String message) {
+            out.println(message);
+        }
+
+        public void sendFile(String sender, String fileName, long fileSize, Socket fileSocket) throws IOException {
+            try (InputStream fileIn = fileSocket.getInputStream()) {
+                // 发送文件接收确认
+                sendMessage("[文件接收开始 from " + sender + "]: " + fileName);
+
+                // 保存文件
+                File outputFile = new File(fileName);
+                try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+                    byte[] buffer = new byte[4096];
+                    int bytesRead;
+                    while ((bytesRead = fileIn.read(buffer)) != -1) {
+                        fos.write(buffer, 0, bytesRead);
+                    }
+                }
+
+                // 发送文件接收完成确认
+                sendMessage("[文件接收完成 from " + sender + "]: " + fileName);
+            }
+        }
+    }
+}
